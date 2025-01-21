@@ -6,6 +6,13 @@ use clap::Parser;
 use log::{info, debug, error};
 use anyhow::{Result, Error};
 
+// Helper macro to add line number information to debug messages
+macro_rules! debug_line {
+    ($($arg:tt)*) => (
+        debug!("{}: {}", line!(), format_args!($($arg)*))
+    );
+}
+
 #[derive(Copy, Clone, PartialEq)]
 #[derive(Debug)]
 struct Node {
@@ -34,7 +41,7 @@ impl Ord for Node {
 /// Heuristic for A* pathfinding: Manhattan distance
 fn heuristic(current: (u32, u32), goal: (u32, u32)) -> f64 {
     let h = (current.0 as f64 - goal.0 as f64).abs() + (current.1 as f64 - goal.1 as f64).abs();
-    debug!("Heuristic from {:?} to {:?}: {:.2}", current, goal, h);
+    debug_line!("Heuristic from {:?} to {:?}: {:.2}", current, goal, h);
     h
 }
 
@@ -63,7 +70,7 @@ fn effort(
     let slope = height_diff / distance;
     let altitude = (from as f64 + to as f64) / 2.0; // Approximate altitude
     let effort = distance + slope_penalty(slope, weight, altitude, fatigue_factor, temperature);
-    debug!("Effort from {} to {} over distance {:.2}: {:.2}", from, to, distance, effort);
+    debug_line!("Effort from {} to {} over distance {:.2}: {:.2}", from, to, distance, effort);
     effort
 }
 
@@ -121,10 +128,10 @@ fn find_optimal_path(
         position: start,
     });
 
-    debug!("Starting pathfinding from {:?} to {:?}", start, goal);
+    debug_line!("Starting pathfinding from {:?} to {:?}", start, goal);
 
     while let Some(Node { cost, position, .. }) = heap.pop() {
-        debug!("Visiting node: {:?} with cost: {:.2}", position, cost);
+        debug_line!("Visiting node: {:?} with cost: {:.2}", position, cost);
 
         if position == goal {
             let mut path = Vec::new();
@@ -136,12 +143,12 @@ fn find_optimal_path(
             path.push(start);
             path.reverse();
             *current_path = path.clone();
-            debug!("Path found: {:?} with total cost: {:.2}", path, cost);
+            debug_line!("Path found: {:?} with total cost: {:.2}", path, cost);
             return Ok((cost, path));
         }
 
         if visited.contains(&position) {
-            debug!("Node {:?} already visited, skipping", position);
+            debug_line!("Node {:?} already visited, skipping", position);
             continue;
         }
 
@@ -155,17 +162,20 @@ fn find_optimal_path(
             } else {
                 1.0 // Horizontal/Vertical movement
             };
+            let from_height = heightmap.get_pixel(position.0, position.1)[0];
+            let to_height = heightmap.get_pixel(nx, ny)[0];
+            debug_line!("Calculating effort from height {} to height {} over distance {:.2}", from_height, to_height, distance);
             let new_cost = cost
                 + effort(
-                    heightmap.get_pixel(position.0, position.1)[0],
-                    heightmap.get_pixel(nx, ny)[0],
+                    from_height,
+                    to_height,
                     distance,
                     weight,
                     fatigue_factor,
                     temperature,
                 );
 
-            debug!("Effort from {:?} to {:?} over distance {:.2}: {:.2}", position, neighbor, distance, new_cost);
+            debug_line!("Effort from {:?} to {:?} over distance {:.2}: {:.2}", position, neighbor, distance, new_cost);
 
             if new_cost < dist[nx as usize][ny as usize] {
                 dist[nx as usize][ny as usize] = new_cost;
@@ -175,11 +185,11 @@ fn find_optimal_path(
                     priority: new_cost + heuristic((nx, ny), goal),
                     position: (nx, ny),
                 });
-                debug!("Updating node {:?} with new cost: {:.2} and priority: {:.2}", (nx, ny), new_cost, new_cost + heuristic((nx, ny), goal));
+                debug_line!("Updating node {:?} with new cost: {:.2} and priority: {:.2}", (nx, ny), new_cost, new_cost + heuristic((nx, ny), goal));
             }
         }
 
-        debug!("Current state of priority queue: {:?}", heap);
+        debug_line!("Current state of priority queue: {:?}", heap);
     }
 
     error!("No valid path found.");
