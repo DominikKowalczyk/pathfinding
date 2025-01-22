@@ -18,11 +18,10 @@ macro_rules! debug_line {
     );
 }
 
-#[derive(Copy, Clone, PartialEq)]
-#[derive(Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 struct Node {
-    cost: f64,     // g(n): the cost to reach this node
-    priority: f64, // f(n) = g(n) + h(n): total cost (includes heuristic)
+    cost: f64,
+    priority: f64,
     position: (u32, u32),
 }
 
@@ -117,7 +116,7 @@ fn find_optimal_path(
     weight: f64,
     fatigue_factor: f64,
     temperature: f64,
-    visited_nodes: &mut HashSet<(u32, u32)>,
+    visited_nodes_history: &mut Vec<Vec<(u32, u32)>>, // Added parameter
     current_path: &mut Vec<(u32, u32)>,
 ) -> Result<(f64, Vec<(u32, u32)>), Error> {
     let (width, height) = heightmap.dimensions();
@@ -158,7 +157,7 @@ fn find_optimal_path(
         }
 
         visited.insert(position);
-        visited_nodes.insert(position);
+        visited_nodes_history.push(visited.iter().cloned().collect()); // Record visited nodes
 
         for neighbor in neighbors(position, width, height) {
             let (nx, ny) = neighbor;
@@ -220,6 +219,7 @@ struct State {
     sc_desc: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    point_pipeline: wgpu::RenderPipeline, // New pipeline for points
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -227,6 +227,8 @@ struct State {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    visited_nodes: Vec<Vec<(u32, u32)>>, // Added field
+    path: Option<Vec<(u32, u32)>>,
 }
 
 impl State {
@@ -235,30 +237,24 @@ impl State {
 
         let instance = wgpu::Instance::new(wgpu::Backends::all());
         let surface = unsafe { instance.create_surface(window) };
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }).await.unwrap();
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::empty(),
-                    limits: wgpu::Limits::default(),
-                    label: None,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                features: wgpu::Features::empty(),
+                limits: wgpu::Limits::default(),
+                label: None,
+            },
+            None,
+        ).await.unwrap();
 
         let sc_desc = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface.get_preferred_format(&adapter)[0],
+            format: surface.get_preferred_format(&adapter).unwrap(),
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -277,7 +273,7 @@ impl State {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::R8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         });
 
@@ -292,66 +288,71 @@ impl State {
             ..Default::default()
         });
 
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("texture_bind_group_layout"),
-            });
+        let texture_data = gray_img.as_raw();
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            texture_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(gray_img.width()),
+                rows_per_image: std::num::NonZeroU32::new(gray_img.height()),
+            },
+            texture_size,
+        );
 
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
+        let (width, height) = gray_img.dimensions();
+        let start = (0, 0);
+        let goal = (width - 1, height - 1);
+        let args = Args::parse();
+        let mut visited_nodes_history: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut current_path = Vec::new();
+
+        let path_result = find_optimal_path(
+            gray_img,
+            start,
+            goal,
+            args.weight,
+            args.fatigue_factor,
+            args.temperature,
+            &mut visited_nodes_history, // Pass history vector
+            &mut current_path,
+        );
+
+        let path = match path_result {
+            Ok((_, p)) => Some(p),
+            Err(e) => {
+                eprintln!("Error finding path: {}", e);
+                None
+            }
+        };
+
+        // Point Shader and Pipeline
+        let point_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: Some("Point Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("point_shader.wgsl").into()),
         });
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        let point_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Point Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
         });
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
+        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Point Pipeline"),
+            layout: Some(&point_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &point_shader,
                 entry_point: "vs_main",
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &point_shader,
                 entry_point: "fs_main",
                 targets: &[wgpu::ColorTargetState {
                     format: sc_desc.format,
@@ -360,7 +361,7 @@ impl State {
                 }],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                topology: wgpu::PrimitiveTopology::PointList, // Use PointList
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
@@ -375,47 +376,70 @@ impl State {
             multiview: None,
         });
 
-        let vertex_data = [
-            // positions    // tex_coords
-            -1.0, -1.0, 0.0, 0.0,
-             1.0, -1.0, 1.0, 0.0,
-             1.0,  1.0, 1.0, 1.0,
-            -1.0,  1.0, 0.0, 1.0,
-        ];
-
-        let index_data = [
-            0u16, 1, 2,
-            0, 2, 3,
-        ];
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertex_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&index_data),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let num_indices = index_data.len() as u32;
-
         Self {
             surface,
             device,
             queue,
             sc_desc,
-            swap_chain: device.create_swap_chain(&surface, &sc_desc),
-            render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
-            texture_bind_group,
+            size,
+            render_pipeline: point_pipeline.clone(), // Use point pipeline for rendering
+            point_pipeline,
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Vertex Buffer"),
+                size: 0,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Index Buffer"),
+                size: 0,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            num_indices: 0,
+            texture_bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler {
+                                filtering: true,
+                                comparison: false,
+                                ..Default::default()
+                            },
+                            count: None,
+                        },
+                    ],
+                    label: Some("texture_bind_group_layout"),
+                }),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+                label: Some("texture_bind_group"),
+            }),
             texture,
             texture_view,
             sampler,
+            visited_nodes: visited_nodes_history,
+            path,
         }
     }
 
@@ -426,58 +450,121 @@ impl State {
         self.surface.configure(&self.device, &self.sc_desc);
     }
 
-    fn input(&mut self, _event: &WindowEvent) -> bool {
-        false
+    fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        state: ElementState::Pressed,
+                        virtual_keycode: Some(VirtualKeyCode::Space),
+                        ..
+                    },
+                ..
+            } => {
+                info!("Starting pathfinding...");
+                self.visited_nodes.clear();
+                self.path = None;
+                // Call find_optimal_path here
+                true
+            }
+            _ => false,
+        }
     }
 
-    fn update(&mut self) {}
+    fn update(&mut self) {
+        // Update logic here
+    }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.swap_chain.get_current_frame()?.output;
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
         });
-
+    
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
                     view: &view,
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: true,
                     },
                 }],
                 depth_stencil_attachment: None,
             });
-
+    
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+    
+            // Draw visited nodes
+            static mut FRAME_COUNTER: usize = 0;
+            let current_step = unsafe {
+                FRAME_COUNTER = (FRAME_COUNTER + 1) % self.visited_nodes.len().max(1); // prevent modulo by zero
+                FRAME_COUNTER
+            };
+    
+            if !self.visited_nodes.is_empty() && current_step < self.visited_nodes.len() {
+                let visited_at_step = &self.visited_nodes[current_step];
+    
+                let mut visited_vertices = Vec::new();
+                for &(x, y) in visited_at_step {
+                    let nx = (x as f32 / self.sc_desc.width as f32) * 2.0 - 1.0;
+                    let ny = (y as f32 / self.sc_desc.height as f32) * -2.0 + 1.0;
+                    visited_vertices.push(nx);
+                    visited_vertices.push(ny);
+                }
+    
+                let visited_vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Visited Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&visited_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let num_visited_vertices = visited_vertices.len() as u32 / 2;
+    
+                render_pass.set_pipeline(&self.point_pipeline);
+                render_pass.set_vertex_buffer(0, visited_vertex_buffer.slice(..));
+                render_pass.draw(0..num_visited_vertices, 0..1);
+            }
+    
+            // Draw path
+            if let Some(path) = &self.path {
+                let mut path_vertices = Vec::new();
+                for &(x, y) in path {
+                    let nx = (x as f32 / self.sc_desc.width as f32) * 2.0 - 1.0;
+                    let ny = (y as f32 / self.sc_desc.height as f32) * -2.0 + 1.0;
+                    path_vertices.push(nx);
+                    path_vertices.push(ny);
+                }
+    
+                let path_vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Path Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&path_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let num_path_vertices = path_vertices.len() as u32 / 2;
+    
+                render_pass.set_pipeline(&self.point_pipeline);
+                render_pass.set_vertex_buffer(0, path_vertex_buffer.slice(..));
+                render_pass.draw(0..num_path_vertices, 0..1);
+            }
         }
-
+    
         self.queue.submit(std::iter::once(encoder.finish()));
-
-        Ok(())
         frame.present();
+    
         Ok(())
-}
-}
-
-#[tokio::main]
+    }}
+    #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
 
-    let _args = Args::parse();
+    let args = Args::parse();
 
     let img = ImageReader::open("heightmap.png")?.decode()?;
     validate_grayscale_image(&img)?;
